@@ -47,6 +47,14 @@ export function toHex(bytes: Uint8Array): string {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
+/** Bytes of lowercase or uppercase hex; throws on an odd length or any other character. */
+export function fromHex(text: string): Uint8Array<ArrayBuffer> {
+  if (!/^(?:[0-9a-fA-F]{2})*$/.test(text)) {
+    throw new Error('Not hex.');
+  }
+  return Uint8Array.from(text.match(/../g) ?? [], (pair) => Number.parseInt(pair, 16));
+}
+
 /** URL-safe base64 without padding, the form of WebAuthn credential IDs. */
 export function toBase64Url(bytes: Uint8Array): string {
   let binary = '';
@@ -68,11 +76,19 @@ export async function sha256(bytes: Uint8Array): Promise<Uint8Array<ArrayBuffer>
   return new Uint8Array(await crypto.subtle.digest('SHA-256', ownBytes(bytes)));
 }
 
-/** The bytes of a stream through a CompressionStream or DecompressionStream. */
+/**
+ * The bytes of a stream through a CompressionStream or DecompressionStream. The input goes in as a
+ * plain ReadableStream, which every runtime has, also test DOMs whose Blob cannot stream.
+ */
 export async function transform(
   bytes: Uint8Array,
   stream: CompressionStream | DecompressionStream,
 ): Promise<Uint8Array<ArrayBuffer>> {
-  const output = new Blob([ownBytes(bytes)]).stream().pipeThrough(stream);
-  return new Uint8Array(await new Response(output).arrayBuffer());
+  const input = new ReadableStream<Uint8Array<ArrayBuffer>>({
+    start(controller) {
+      controller.enqueue(ownBytes(bytes));
+      controller.close();
+    },
+  });
+  return new Uint8Array(await new Response(input.pipeThrough(stream)).arrayBuffer());
 }

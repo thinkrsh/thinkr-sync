@@ -1,7 +1,7 @@
-import { RECOVERY_CODE } from './config/format.js';
+import { FORMAT, RECOVERY_CODE } from './config/format.js';
+import { deriveBytes } from './crypto.js';
 import { SyncError } from './errors.js';
 import { randomBytes } from './lib/bytes.js';
-import { unwrapSecret, wrapSecret, type WrappedKey } from './wrap.js';
 
 const BITS_PER_CHARACTER = 5;
 const CODE_LENGTH = Math.ceil((RECOVERY_CODE.bytes * 8) / BITS_PER_CHARACTER);
@@ -10,32 +10,20 @@ const CODE_LENGTH = Math.ceil((RECOVERY_CODE.bytes * 8) / BITS_PER_CHARACTER);
 const LOOKALIKES: Readonly<Record<string, string>> = { O: '0', I: '1', L: '1' };
 
 /**
- * A new recovery code: 160 random bits, such as `7KQ2-M9XA-...`. Show it to the user once; the
- * history keeps only the key that it wraps.
+ * A new recovery code: 160 random bits, such as `7KQ2-M9XA-...`. Show it to the user once and keep
+ * no copy: the secret of the history derives from it.
  */
 export function newRecoveryCode(): string {
   return formatCode(encode(randomBytes(RECOVERY_CODE.bytes)));
 }
 
-/** Wraps the secret of a history with a recovery code. */
-export async function wrapWithRecoveryCode(secret: Uint8Array, code: string): Promise<WrappedKey> {
-  return wrapSecret(secret, parseRecoveryCode(code), 'recovery', { credentialId: '', prfSalt: '' });
-}
-
-/** Opens the secret of a history with a recovery code; throws WRONG_KEY for another code. */
-export async function unwrapWithRecoveryCode(
-  wrappedKeys: readonly WrappedKey[],
-  code: string,
-): Promise<Uint8Array> {
-  const material = parseRecoveryCode(code);
-  for (const wrapped of wrappedKeys.filter((key) => key.kind === 'recovery')) {
-    try {
-      return await unwrapSecret(wrapped, material);
-    } catch (error) {
-      if (!(error instanceof SyncError && error.code === 'WRONG_KEY')) throw error;
-    }
-  }
-  throw new SyncError('WRONG_KEY', 'This recovery code does not open the history.');
+/**
+ * The secret of the history of a recovery code, by HKDF-SHA-256. The same code gives the same
+ * secret on every device, so the code alone names the backup and opens it. Throws WRONG_KEY for a
+ * code of the wrong shape.
+ */
+export async function historySecretFromRecoveryCode(code: string): Promise<Uint8Array> {
+  return deriveBytes(parseRecoveryCode(code), FORMAT.labels.recoverySecret, FORMAT.historyKeyBytes);
 }
 
 /**

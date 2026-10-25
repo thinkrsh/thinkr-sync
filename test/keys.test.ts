@@ -2,10 +2,9 @@ import { describe, expect, it } from 'vitest';
 import { SyncError } from '../src/errors.js';
 import { deriveHistoryKeys, newHistorySecret } from '../src/keys.js';
 import {
+  historySecretFromRecoveryCode,
   newRecoveryCode,
   parseRecoveryCode,
-  unwrapWithRecoveryCode,
-  wrapWithRecoveryCode,
 } from '../src/recovery.js';
 import { toHex } from '../src/lib/bytes.js';
 
@@ -52,32 +51,23 @@ describe('recovery code', () => {
     expect(toHex(parseRecoveryCode(typed))).toBe(toHex(parseRecoveryCode(code)));
   });
 
-  it('opens the secret it wrapped, and no other code does', async () => {
-    const secret = newHistorySecret();
+  it('gives the same history on every device, and another code another one', async () => {
     const code = newRecoveryCode();
-    const wrapped = await wrapWithRecoveryCode(secret, code);
-    expect(toHex(await unwrapWithRecoveryCode([wrapped], code))).toBe(toHex(secret));
-    await rejectsWith(unwrapWithRecoveryCode([wrapped], newRecoveryCode()), 'WRONG_KEY');
+    const typed = code.toLowerCase().replaceAll('-', ' ');
+    const [secret, again, other] = await Promise.all([
+      historySecretFromRecoveryCode(code),
+      historySecretFromRecoveryCode(typed),
+      historySecretFromRecoveryCode(newRecoveryCode()),
+    ]);
+    expect(secret).toHaveLength(32);
+    expect(toHex(again)).toBe(toHex(secret));
+    expect(toHex(other)).not.toBe(toHex(secret));
+    const keys = await deriveHistoryKeys(secret);
+    expect((await deriveHistoryKeys(again)).storeId).toBe(keys.storeId);
   });
 
   it('rejects a code of the wrong length or with a stray character', async () => {
-    const wrapped = await wrapWithRecoveryCode(newHistorySecret(), newRecoveryCode());
-    await rejectsWith(unwrapWithRecoveryCode([wrapped], 'ABCD-EFGH'), 'WRONG_KEY');
-    await rejectsWith(
-      unwrapWithRecoveryCode([wrapped], `U${newRecoveryCode().slice(1)}`),
-      'WRONG_KEY',
-    );
-  });
-
-  it('fails when a byte of the wrapped key changes', async () => {
-    const code = newRecoveryCode();
-    const wrapped = await wrapWithRecoveryCode(newHistorySecret(), code);
-    const flipped = wrapped.ciphertext.startsWith('A')
-      ? `B${wrapped.ciphertext.slice(1)}`
-      : `A${wrapped.ciphertext.slice(1)}`;
-    await rejectsWith(
-      unwrapWithRecoveryCode([{ ...wrapped, ciphertext: flipped }], code),
-      'WRONG_KEY',
-    );
+    await rejectsWith(historySecretFromRecoveryCode('ABCD-EFGH'), 'WRONG_KEY');
+    await rejectsWith(historySecretFromRecoveryCode(`U${newRecoveryCode().slice(1)}`), 'WRONG_KEY');
   });
 });

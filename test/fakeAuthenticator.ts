@@ -10,6 +10,11 @@ export interface FakeOptions {
   prfAtCreation: boolean;
 }
 
+interface FakeCredential {
+  secret: Uint8Array;
+  userHandle: Uint8Array;
+}
+
 function bytesOf(source: BufferSource): Uint8Array {
   return ArrayBuffer.isView(source)
     ? new Uint8Array(source.buffer, source.byteOffset, source.byteLength)
@@ -19,19 +24,32 @@ function bytesOf(source: BufferSource): Uint8Array {
 /**
  * An authenticator in memory. Its PRF is what browsers and CTAP2 do: the browser hashes the input
  * with the prefix "WebAuthn PRF" and a zero byte, and the authenticator returns the HMAC-SHA-256 of
- * that hash under a secret of the credential.
+ * that hash under a secret of the credential. A sign-in with no allowed credentials offers every
+ * passkey, as a discoverable credential does, and the user picks the one named by `choose`, or else
+ * the newest.
  */
 export class FakeAuthenticator implements PasskeyAuthenticator {
   readonly calls: ('create' | 'get')[] = [];
-  private readonly credentials = new Map<string, Uint8Array>();
+  private readonly credentials = new Map<string, FakeCredential>();
+  private chosen: string | undefined;
 
   constructor(private readonly options: FakeOptions) {}
+
+  /** The credential that the user picks in the next sign-in without allowed credentials. */
+  choose(credentialId: string): void {
+    this.chosen = credentialId;
+  }
+
+  /** The user handle that a credential keeps, as the passkey manager stores it. */
+  userHandleOf(credentialId: string): Uint8Array | undefined {
+    return this.credentials.get(credentialId)?.userHandle;
+  }
 
   async create(options: PublicKeyCredentialCreationOptions): Promise<PasskeyResult> {
     this.calls.push('create');
     const credentialId = toBase64Url(randomBytes(16));
     const secret = randomBytes(32);
-    this.credentials.set(credentialId, secret);
+    this.credentials.set(credentialId, { secret, userHandle: bytesOf(options.user.id).slice() });
     const input = options.extensions?.prf?.eval?.first;
     const giveOutput =
       this.options.prfSupported && this.options.prfAtCreation && input !== undefined;
@@ -39,6 +57,7 @@ export class FakeAuthenticator implements PasskeyAuthenticator {
       credentialId,
       prfOutput: giveOutput ? await prf(secret, bytesOf(input)) : undefined,
       prfEnabled: this.options.prfSupported,
+      userHandle: undefined,
     };
   }
 
@@ -47,19 +66,24 @@ export class FakeAuthenticator implements PasskeyAuthenticator {
     const allowed = (options.allowCredentials ?? []).map((credential) =>
       toBase64Url(bytesOf(credential.id)),
     );
-    const credentialId = allowed.find((id) => this.credentials.has(id));
-    const secret = credentialId === undefined ? undefined : this.credentials.get(credentialId);
-    if (credentialId === undefined || secret === undefined) {
+    const credentialId =
+      allowed.length === 0
+        ? (this.chosen ?? [...this.credentials.keys()].at(-1))
+        : allowed.find((id) => this.credentials.has(id));
+    const credential = credentialId === undefined ? undefined : this.credentials.get(credentialId);
+    if (credentialId === undefined || credential === undefined) {
       throw new SyncError('PASSKEY_CANCELLED', 'No passkey of this authenticator was allowed.');
     }
-    const input = options.extensions?.prf?.evalByCredential?.[credentialId]?.first;
+    const prfInputs = options.extensions?.prf;
+    const input = prfInputs?.evalByCredential?.[credentialId]?.first ?? prfInputs?.eval?.first;
     return {
       credentialId,
       prfOutput:
         this.options.prfSupported && input !== undefined
-          ? await prf(secret, bytesOf(input))
+          ? await prf(credential.secret, bytesOf(input))
           : undefined,
       prfEnabled: undefined,
+      userHandle: credential.userHandle,
     };
   }
 }

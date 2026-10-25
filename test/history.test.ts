@@ -3,7 +3,8 @@ import { openBackup, parseBackup, sealBackup, type BackupContent } from '../src/
 import { SyncError } from '../src/errors.js';
 import { deriveHistoryKeys, newHistorySecret, type HistoryKeys } from '../src/keys.js';
 import { openRecord, sealRecord } from '../src/records.js';
-import { newRecoveryCode, wrapWithRecoveryCode } from '../src/recovery.js';
+import { addPasskey } from '../src/passkey.js';
+import { FakeAuthenticator } from './fakeAuthenticator.js';
 
 const CHAT = {
   id: 'chat-1',
@@ -69,7 +70,12 @@ describe('records', () => {
 describe('backups', () => {
   it('open to the chats they hold, with the wrapped keys readable', async () => {
     const history = await keys();
-    const wrapped = await wrapWithRecoveryCode(newHistorySecret(), newRecoveryCode());
+    const authenticator = new FakeAuthenticator({ prfSupported: true, prfAtCreation: true });
+    const wrapped = await addPasskey(newHistorySecret(), authenticator, {
+      rpId: 'chat.thinkr.sh',
+      rpName: 'Thinkr',
+      userName: 'Thinkr backup',
+    });
     const backup = await sealBackup(history, [wrapped], content(3));
     expect(JSON.stringify(backup)).not.toContain('MARKER');
     expect(parseBackup(JSON.parse(JSON.stringify(backup))).keys).toEqual([wrapped]);

@@ -40,6 +40,7 @@ const STATUS = {
   ok: 200,
   created: 201,
   noContent: 204,
+  notModified: 304,
   badRequest: 400,
   unauthorized: 401,
   forbidden: 403,
@@ -62,7 +63,7 @@ export async function handleSyncRequest(request: Request, store: SyncStore): Pro
   }
   switch (request.method) {
     case 'GET':
-      return getBackup(store, storeId);
+      return getBackup(request, store, storeId);
     case 'PUT':
       return putBackup(request, store, storeId);
     case 'DELETE':
@@ -72,9 +73,16 @@ export async function handleSyncRequest(request: Request, store: SyncStore): Pro
   }
 }
 
-async function getBackup(store: SyncStore, storeId: string): Promise<Response> {
+/** The backup, or 304 when the device names the tag of the backup it has already. */
+async function getBackup(request: Request, store: SyncStore, storeId: string): Promise<Response> {
   const stored = await store.get(storeId);
   if (stored === undefined) return status(STATUS.notFound);
+  if (sameTag(request.headers.get('If-None-Match'), stored.etag)) {
+    return new Response(null, {
+      status: STATUS.notModified,
+      headers: { ETag: stored.etag, 'Cache-Control': 'no-store' },
+    });
+  }
   return new Response(stored.body, {
     status: STATUS.ok,
     headers: {
@@ -100,15 +108,12 @@ async function putBackup(request: Request, store: SyncStore, storeId: string): P
   if (current !== undefined && expected === undefined) {
     return status(createOnly ? STATUS.preconditionFailed : STATUS.preconditionRequired);
   }
-  if (current === undefined && expected !== undefined) {
+  if (current === undefined ? expected !== undefined : !sameTag(expected, current.etag)) {
     return status(STATUS.preconditionFailed);
   }
   const etag = `"${toHex(await sha256(utf8(body)))}"`;
-  const written = await store.putIf(
-    storeId,
-    { body, etag, tokenHash },
-    current === undefined ? undefined : expected,
-  );
+  // The write names the stored tag, so a backup that changed since the check is not lost.
+  const written = await store.putIf(storeId, { body, etag, tokenHash }, current?.etag);
   if (!written) return status(STATUS.preconditionFailed);
   return new Response(null, {
     status: current === undefined ? STATUS.created : STATUS.ok,
@@ -135,6 +140,16 @@ async function writeTokenHash(request: Request): Promise<string | undefined> {
   const token = /^Bearer (\S+)$/.exec(request.headers.get('Authorization') ?? '')?.[1];
   if (token === undefined || !SYNC_SERVER.writeTokenPattern.test(token)) return undefined;
   return toHex(await sha256(utf8(token)));
+}
+
+/**
+ * Whether a tag that a device sends names the stored backup. A proxy in between that compresses an
+ * answer may change its tag, to W/"<hash>" or "<hash>-gzip", so only the hash inside counts.
+ */
+function sameTag(sent: string | null | undefined, stored: string): boolean {
+  const hash = (tag: string): string | undefined => /[0-9a-f]{64}/.exec(tag)?.[0];
+  const sentHash = sent === null || sent === undefined ? undefined : hash(sent);
+  return sentHash !== undefined && sentHash === hash(stored);
 }
 
 function sameHash(a: string, b: string): boolean {

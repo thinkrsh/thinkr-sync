@@ -18,15 +18,20 @@ export const SYNC_ERROR_CODES = [
 
 export type SyncErrorCode = (typeof SYNC_ERROR_CODES)[number];
 
-/** An error of Thinkr sync, with a code for the caller and a message for people. */
+/**
+ * An error of Thinkr sync, with a code for the caller and a message for people. A SERVER error
+ * carries the HTTP status of the answer, such as 413 for a backup over the limit of the server.
+ */
 export class SyncError extends Error {
   override readonly name = 'SyncError';
+  readonly status: number | undefined;
 
   constructor(
     readonly code: SyncErrorCode,
     message: string,
-    options?: { cause?: unknown },
+    options?: { cause?: unknown; status?: number },
   ) {
     super(message, options);
+    this.status = options?.status;
   }
 }

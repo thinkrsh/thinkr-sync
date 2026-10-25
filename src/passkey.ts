@@ -1,6 +1,7 @@
 import { FORMAT, PASSKEY } from './config/format.js';
 import { SyncError } from './errors.js';
-import { fromBase64Url, randomBytes, toBase64Url } from './lib/bytes.js';
+import { storeIdBytes } from './keys.js';
+import { fromBase64Url, randomBytes, sha256, toBase64Url, toHex, utf8 } from './lib/bytes.js';
 import { unwrapSecret, wrapSecret, type WrappedKey } from './wrap.js';
 
 /** What one WebAuthn ceremony gives back: the credential, and the PRF output when there is one. */
@@ -10,6 +11,8 @@ export interface PasskeyResult {
   prfOutput: Uint8Array | undefined;
   /** From registration only: whether the authenticator supports the PRF at all. */
   prfEnabled: boolean | undefined;
+  /** From sign-in only: the user handle of the passkey, which names the store of its history. */
+  userHandle: Uint8Array | undefined;
 }
 
 /**
@@ -29,6 +32,14 @@ export interface PasskeyAccount {
   userName: string;
 }
 
+/** A passkey that the user picked on a device that knows no history yet, with what it unlocks. */
+export interface FoundPasskey {
+  /** The store ID of its history, from its user handle, as hex. */
+  storeId: string;
+  credentialId: string;
+  prfOutput: Uint8Array;
+}
+
 /** The ceremonies of the browser, through `navigator.credentials`. */
 export function browserAuthenticator(): PasskeyAuthenticator {
   return {
@@ -40,17 +51,20 @@ export function browserAuthenticator(): PasskeyAuthenticator {
 }
 
 /**
- * Registers a passkey and wraps the secret of a history with its PRF. Some authenticators return
- * the PRF output at registration; for the others, one more prompt reads it. Throws PRF_UNSUPPORTED
- * when the passkey cannot give one: the user then needs the recovery code.
+ * Registers a passkey and wraps the secret of a history with its PRF. The user handle of the passkey
+ * is the store ID of the history, so a new device finds the backup from the passkey alone. Some
+ * authenticators return the PRF output at registration; for the others, one more prompt reads it.
+ * Throws PRF_UNSUPPORTED when the passkey cannot give one: the user then needs the recovery code.
  */
 export async function addPasskey(
   secret: Uint8Array,
   authenticator: PasskeyAuthenticator,
   account: PasskeyAccount,
 ): Promise<WrappedKey> {
-  const prfSalt = randomBytes(FORMAT.prfSaltBytes);
-  const created = await authenticator.create(creationOptions(account, prfSalt));
+  const prfSalt = await passkeyPrfSalt();
+  const created = await authenticator.create(
+    creationOptions(account, await storeIdBytes(secret), prfSalt),
+  );
   if (created.prfEnabled === false) {
     throw new SyncError('PRF_UNSUPPORTED', 'This passkey cannot derive keys (no PRF support).');
   }
@@ -58,7 +72,7 @@ export async function addPasskey(
     created.prfOutput ??
     (await readPrf(authenticator, account.rpId, [{ credentialId: created.credentialId, prfSalt }]))
       .prfOutput;
-  return wrapSecret(secret, requirePrf(prfOutput), 'passkey', {
+  return wrapSecret(secret, requirePrf(prfOutput), {
     credentialId: created.credentialId,
     prfSalt: toBase64Url(prfSalt),
   });
@@ -70,36 +84,80 @@ export async function unwrapWithPasskey(
   authenticator: PasskeyAuthenticator,
   rpId: string,
 ): Promise<Uint8Array> {
-  const passkeys = wrappedKeys.filter((key) => key.kind === 'passkey');
-  if (passkeys.length === 0) {
+  if (wrappedKeys.length === 0) {
     throw new SyncError('WRONG_KEY', 'The history has no passkey.');
   }
   const result = await readPrf(
     authenticator,
     rpId,
-    passkeys.map((key) => ({
+    wrappedKeys.map((key) => ({
       credentialId: key.credentialId,
       prfSalt: fromBase64Url(key.prfSalt),
     })),
   );
-  const wrapped = passkeys.find((key) => key.credentialId === result.credentialId);
-  if (wrapped === undefined) {
-    throw new SyncError('PASSKEY_CANCELLED', 'The chosen passkey does not belong to this history.');
+  return unwrapWith(wrappedKeys, result.credentialId, requirePrf(result.prfOutput));
+}
+
+/**
+ * On a device that knows no history yet: one prompt in which the user picks any passkey of this
+ * domain. It gives the store ID of the history and the PRF output that unwraps its secret, so the
+ * device can pull the backup and open it. Throws WRONG_KEY for a passkey of no history.
+ */
+export async function findWithPasskey(
+  authenticator: PasskeyAuthenticator,
+  rpId: string,
+): Promise<FoundPasskey> {
+  const result = await authenticator.get({
+    rpId,
+    challenge: randomBytes(PASSKEY.challengeBytes),
+    allowCredentials: [],
+    userVerification: 'required',
+    timeout: PASSKEY.timeoutMs,
+    extensions: { prf: { eval: { first: await passkeyPrfSalt() } } },
+  });
+  if (result.userHandle?.length !== FORMAT.storeIdBytes) {
+    throw new SyncError('WRONG_KEY', 'This passkey belongs to no history.');
   }
-  return unwrapSecret(wrapped, requirePrf(result.prfOutput));
+  return {
+    storeId: toHex(result.userHandle),
+    credentialId: result.credentialId,
+    prfOutput: requirePrf(result.prfOutput),
+  };
+}
+
+/** Opens the secret of a history with a passkey that `findWithPasskey` found. */
+export async function unwrapFoundPasskey(
+  wrappedKeys: readonly WrappedKey[],
+  found: FoundPasskey,
+): Promise<Uint8Array> {
+  return unwrapWith(wrappedKeys, found.credentialId, found.prfOutput);
+}
+
+async function unwrapWith(
+  wrappedKeys: readonly WrappedKey[],
+  credentialId: string,
+  prfOutput: Uint8Array,
+): Promise<Uint8Array> {
+  const wrapped = wrappedKeys.find((key) => key.credentialId === credentialId);
+  if (wrapped === undefined) {
+    throw new SyncError('WRONG_KEY', 'The chosen passkey does not belong to this history.');
+  }
+  return unwrapSecret(wrapped, prfOutput);
+}
+
+/** The input of the PRF, the same for every passkey (see FORMAT.prfSaltBytes). */
+async function passkeyPrfSalt(): Promise<Uint8Array<ArrayBuffer>> {
+  return sha256(utf8(FORMAT.labels.passkeyPrf));
 }
 
 function creationOptions(
   account: PasskeyAccount,
+  userHandle: Uint8Array<ArrayBuffer>,
   prfSalt: Uint8Array<ArrayBuffer>,
 ): PublicKeyCredentialCreationOptions {
   return {
     rp: { id: account.rpId, name: account.rpName },
-    user: {
-      id: randomBytes(PASSKEY.userIdBytes),
-      name: account.userName,
-      displayName: account.userName,
-    },
+    user: { id: userHandle, name: account.userName, displayName: account.userName },
     challenge: randomBytes(PASSKEY.challengeBytes),
     pubKeyCredParams: PASSKEY.algorithms.map((alg) => ({ type: 'public-key', alg })),
     authenticatorSelection: { residentKey: 'required', userVerification: 'required' },
@@ -160,10 +218,14 @@ async function ceremony(run: () => Promise<Credential | null>): Promise<PublicKe
 function toResult(credential: PublicKeyCredential): PasskeyResult {
   const prf = credential.getClientExtensionResults().prf;
   const first = prf?.results?.first;
+  const { response } = credential;
+  const userHandle =
+    response instanceof AuthenticatorAssertionResponse ? response.userHandle : null;
   return {
     credentialId: toBase64Url(new Uint8Array(credential.rawId)),
     prfOutput: first === undefined ? undefined : bufferBytes(first),
     prfEnabled: prf?.enabled,
+    userHandle: userHandle === null ? undefined : new Uint8Array(userHandle).slice(),
   };
 }
 

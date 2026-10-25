@@ -6,7 +6,7 @@ import { isRecord } from './lib/json.js';
 import type { HistoryKeys } from './keys.js';
 import { parseWrappedKey, type WrappedKey } from './wrap.js';
 
-/** One chat inside a backup. */
+/** One record inside a backup, such as a chat. The app gives each record an ID of its own. */
 export interface BackupRecord {
   id: string;
   value: unknown;
@@ -22,7 +22,8 @@ export interface BackupContent {
 
 /**
  * The backup of a history, as the server keeps it. The wrapped keys stay readable, so a new device
- * can open the history with a passkey or the recovery code; the chats are one sealed blob.
+ * can open the history with a passkey; the recovery code gives the secret without them. The records
+ * are one sealed blob.
  */
 export interface Backup {
   v: typeof FORMAT.version;
@@ -32,7 +33,7 @@ export interface Backup {
   ciphertext: string;
 }
 
-/** Seals the chats of a history into a backup: JSON, gzip, then AES-256-GCM. */
+/** Seals the records of a history into a backup: JSON, gzip, then AES-256-GCM. */
 export async function sealBackup(
   keys: HistoryKeys,
   wrappedKeys: readonly WrappedKey[],
